@@ -1,0 +1,555 @@
+# 🛕 Jagannath Temple Donation System — v11.0 (MongoDB Edition)
+
+> **Backend converted from MySQL / SQLAlchemy → MongoDB / PyMongo**
+> All API endpoints, frontend JavaScript, and application flow are **identical**.
+> Only the database layer has changed.
+
+---
+
+## 📁 Project Structure
+
+```
+PROJECT_TEMPLE-DONATION - Mongodb/
+│
+├── main.py              ← FastAPI app — all API routes (~1 000 lines)
+├── database.py          ← MongoClient + get_db() + get_next_id() + indexes
+├── models.py            ← Row wrapper + collection constants + doc builders
+├── schemas.py           ← Pydantic v2 request/response models (unchanged)
+├── faq_routes.py        ← FAQ CRUD sub-router (mounted at /faq)
+├── seed.py              ← Seeds zodiac, gotra, tithis, calendar data
+├── seed_faq.py          ← Seeds FAQ content
+├── requirements.txt     ← Python dependencies
+├── .env                 ← Secrets (never commit to Git)
+├── .env.example         ← Template — copy to .env and fill in values
+├── CODE_STRUCTURE.py    ← Full annotated code-structure reference
+│
+├── templates/
+│   └── index.html       ← Multi-step frontend UI (unchanged)
+│
+└── static/
+    ├── app.js           ← All frontend logic — fetch() calls only (unchanged)
+    └── style.css        ← All styling (unchanged)
+```
+
+> ✅ No `Database.sql` needed — MongoDB creates collections automatically on first write.
+
+---
+
+## ⚡ Quick Start
+
+### Option A — Local Setup (Windows / Linux / Mac)
+
+```bash
+# 1. Clone / extract the project
+cd "PROJECT_TEMPLE-DONATION - Mongodb"
+
+# 2. Create & activate virtual environment
+python -m venv venv
+# Windows:
+venv\Scripts\activate
+# Linux / Mac:
+source venv/bin/activate
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Copy .env.example → .env and fill in your values
+cp .env.example .env
+
+# 5. Ensure MongoDB is running (see MongoDB Setup section below)
+
+# 6. Seed master data (run once)
+python seed.py
+python seed_faq.py
+
+# 7. Start the server
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Open → **http://localhost:8000**
+Swagger API Docs → **http://localhost:8000/docs**
+
+---
+
+### Option B — Docker (single container, MongoDB + FastAPI)
+
+```bash
+# Build
+docker build -t temple-donation .
+
+# Run (creates named volume for data persistence)
+docker run -d \
+  -p 8000:8000 \
+  -v temple_data:/data/db \
+  -e DB_NAME=temple_donation \
+  -e SMTP_USER=you@gmail.com \
+  -e SMTP_PASSWORD=your_app_password \
+  --name temple-app \
+  temple-donation
+
+# Seed data (first time only)
+docker exec -it temple-app python seed.py
+docker exec -it temple-app python seed_faq.py
+```
+
+Open → **http://localhost:8000**
+
+---
+
+## 🍃 MongoDB Setup (Local)
+
+### Windows
+
+1. Download from: https://www.mongodb.com/try/download/community
+2. Choose **Windows → MSI installer**
+3. ✅ Check **"Install MongoDB as a Service"** during setup
+4. Start:
+   ```cmd
+   net start MongoDB
+   ```
+5. Verify:
+   ```cmd
+   mongosh
+   # Should show: Connecting to: mongodb://127.0.0.1:27017
+   ```
+
+### Linux (Ubuntu/Debian)
+
+```bash
+curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | \
+  sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
+
+echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] \
+  https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | \
+  sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
+
+sudo apt update && sudo apt install -y mongodb-org
+sudo systemctl start mongod
+sudo systemctl enable mongod
+```
+
+### Mac
+
+```bash
+brew tap mongodb/brew
+brew install mongodb-community@7.0
+brew services start mongodb/brew/mongodb-community
+```
+
+---
+
+## ⚙️ Environment Variables
+
+Create `.env` in the project root (copy from `.env.example`):
+
+```env
+# ── MongoDB ─────────────────────────────────────────
+MONGO_URI=mongodb://localhost:27017
+DB_NAME=temple_donation
+
+# ── Gmail SMTP (for email OTP & confirmations) ───────
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your_email@gmail.com
+SMTP_PASSWORD=your_16_char_app_password
+SMTP_FROM=your_email@gmail.com
+
+# ── MessageWall SMS (phone OTP) ──────────────────────
+# Register at: https://www.messagewall.in/
+MESSAGEWALL_API_KEY=your_key
+MESSAGEWALL_SENDER_ID=JGNATH
+MESSAGEWALL_TEMPLATE_ID=your_template_id
+MESSAGEWALL_ROUTE=2
+MESSAGEWALL_API_URL=http://text.messagewall.in/api/smsapi
+MESSAGEWALL_SETUP_TEMPLATE_ID=your_setup_template_id
+
+# ── WhatsApp (co3.live / pinbot.ai) ──────────────────
+WA_API_KEY=your_wa_api_key
+WA_PHONE_NUMBER_ID=your_phone_number_id
+WA_TEMPLATE_NAME=your_template_name
+WA_API_BASE=https://partnersv1.pinbot.ai/v3
+```
+
+> **Gmail App Password** — Go to Google Account → Security → 2-Step Verification → App Passwords → Create for "Mail"
+
+> ⚠️ Add `.env` to `.gitignore` — never commit secrets to Git
+
+---
+
+## 🏗️ Architecture Overview
+
+### How Auto-Increment IDs Work
+
+MongoDB uses `ObjectId` by default. This app uses **integer IDs** (matching the original MySQL schema) via a `counters` collection:
+
+```
+counters collection:
+  { _id: "donors",         seq: 42  }
+  { _id: "seva_donations", seq: 128 }
+  { _id: "users",          seq: 3   }
+```
+
+Every insert calls `findOneAndUpdate` with `$inc: {seq: 1}` — **atomic** and safe under concurrent requests.
+
+```python
+# database.py
+def get_next_id(collection_name: str) -> int:
+    result = db["counters"].find_one_and_update(
+        {"_id": collection_name},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=True,
+    )
+    return result["seq"]
+```
+
+### How the Row Wrapper Works
+
+The `Row` class (`models.py`) converts MongoDB dicts to dot-access objects so all endpoint code remains clean:
+
+```python
+doc  = db["users"].find_one({"username": "admin"})
+user = Row(doc)
+
+user.id        # → doc["_id"]   (_id is mapped to id automatically)
+user.username  # → doc["username"]
+user.missing   # → None         (never raises KeyError)
+bool(Row(None))# → False        (safe None check)
+```
+
+### Cascade Deletes
+
+MongoDB has no foreign-key constraints. All cascades are handled explicitly:
+
+```python
+# DELETE /donors/{id}
+donations    = list(db["seva_donations"].find({"donor_id": id}))
+donation_ids = [d["_id"] for d in donations]
+persons      = list(db["seva_persons"].find({"seva_donation_id": {"$in": donation_ids}}))
+person_ids   = [p["_id"] for p in persons]
+
+db["seva_person_relations"].delete_many({"seva_person_id": {"$in": person_ids}})
+db["seva_persons"].delete_many({"seva_donation_id": {"$in": donation_ids}})
+db["seva_donations"].delete_many({"donor_id": id})
+db["donors"].delete_one({"_id": id})
+```
+
+---
+
+## 🗺️ Application Flow (5 Steps)
+
+```
+Step 1: Enter WhatsApp Number
+        ↓
+        Phone exists in MongoDB?
+        YES → skip OTP → pre-fill donor form
+        NO  → SMS OTP via MessageWall → verify → empty form
+        ↓
+Step 2: Donor Details
+        Name (First / Middle / Last)
+        Gender, Email, DOB, Wedding Date
+        Address + GPS (auto-filled via Nominatim)
+        Profile photo (webcam or avatar)
+        Profession: Work → Designation | Student → Institution
+        ↓
+Step 3: Seva Details
+        Seva Name (from MongoDB seva collection)
+        Seva Type: One Time | Regular
+        Donation Amount (default pre-filled, editable)
+        Transaction ID (optional — for GPay / bank transfer)
+        Auto-generated Receipt:  JGN-YYYYMMDD-XXXX
+        ↓
+Step 4: Seva Person Details
+        Name, Gotra, Birthstar (Nakshatra), Zodiac (Rashi)
+        Seva Date: English calendar OR Hindu calendar
+          Hindu → auto-converts to Gregorian via ephem library
+        Family members / relations (optional, unlimited)
+        ↓
+Step 5: Receipt & Confirmation
+        Printable receipt with all details
+        AI-generated Seva Blessing Card (Pollinations.ai, free)
+        Email confirmation sent to donor (SMTP)
+        WhatsApp confirmation via co3.live API
+```
+
+---
+
+## 🗃️ MongoDB Collections
+
+| Collection | Purpose | Key Indexes |
+|---|---|---|
+| `counters` | Auto-increment ID tracker | `_id` (collection name) |
+| `users` | Admin / staff login accounts | `username` unique, `email` unique |
+| `user_roles` | Custom role labels | `role_name` unique |
+| `zodiac` | 12 Rashi signs | `zodiac_order` |
+| `birthstar` | 27 Nakshatras | `zodiac_id + star_order` |
+| `gotra` | Gotra list | `gotra_name` unique |
+| `donors` | Donor master | `whatsapp_number` unique, `email` unique |
+| `seva` | Seva master list | `seva_name` unique |
+| `seva_donations` | Each seva booking | `receipt_no` unique, `donor_id`, `seva_id` |
+| `seva_persons` | Seva person per booking | `seva_donation_id` unique |
+| `seva_person_relations` | Family members | `seva_person_id` |
+| `purnima_names` | 13 Purnima months | `name` unique, `display_order` |
+| `amavasya_names` | 13 Amavasya months | `name` unique, `display_order` |
+| `krishna_paksha_tithis` | 14 waning-moon tithis | `tithi_name` unique |
+| `shukla_paksha_tithis` | 14 waxing-moon tithis | `tithi_name` unique |
+| `faqs` | FAQ content | `order`, `_id` |
+
+---
+
+## 📡 API Endpoints
+
+### 🔐 Auth
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/auth/setup-status` | Check if first admin exists |
+| POST | `/auth/setup/send-phone-otp` | Send SMS OTP for first-time admin setup |
+| POST | `/auth/setup/verify-phone-otp` | Verify SMS OTP |
+| POST | `/auth/admin-setup` | Create first Administrator (one-time only) |
+| POST | `/auth/login` | Login — returns user info + is_admin flag |
+| POST | `/auth/signup` | Normal user self-registration |
+| POST | `/auth/forgot-password` | Send reset OTP to admin email |
+| POST | `/auth/forgot-password/verify` | Verify reset OTP |
+| POST | `/auth/forgot-password/set-password` | Set new password |
+
+### 👤 Donors
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/check-phone?whatsapp_number=` | Check phone exists, return donor |
+| GET | `/search-donor?first_name=&whatsapp_number=` | Search donors |
+| POST | `/donors` | Create new donor |
+| PUT | `/donors/{id}` | Update donor |
+| DELETE | `/donors/{id}?admin_username=` | Delete donor + cascade |
+| GET | `/donors/{id}/seva-donations` | Donor's full seva history |
+| GET | `/geocode?line1=&city=&state=&pincode=` | Server-side geocoding |
+
+### 🙏 Seva & Donations
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/admin/sevas` | List all sevas |
+| POST | `/admin/sevas?admin_username=` | Add new seva |
+| PUT | `/admin/sevas/{id}?admin_username=` | Update seva |
+| DELETE | `/admin/sevas/{id}?admin_username=` | Delete seva |
+| POST | `/seva-donations` | Submit full seva booking |
+| PUT | `/seva-donations/{id}` | Update booking |
+| DELETE | `/seva-donations/{id}?whatsapp_number=` | Delete booking |
+| GET | `/receipt/{receipt_no}` | Fetch receipt data (Step 5) |
+| POST | `/seva-donations/{id}/send-confirmation` | Send email to donor |
+| POST | `/seva-donations/{id}/send-whatsapp` | Send WhatsApp confirmation |
+| POST | `/seva-donations/{id}/generate-seva-image` | Generate AI blessing card |
+| GET | `/seva-donations/{id}/seva-image-status` | Poll AI image status |
+| GET | `/seva-donations/{id}/seva-image` | Get AI blessing card |
+
+### 👑 Admin Panel
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/admin/users?admin_username=` | List all users |
+| POST | `/admin/users?admin_username=` | Create user |
+| DELETE | `/admin/users/{id}?admin_username=` | Delete user |
+| GET | `/admin/roles?admin_username=` | List role labels |
+| POST | `/admin/roles?admin_username=` | Create role |
+| DELETE | `/admin/roles/{id}?admin_username=` | Delete role |
+| GET | `/admin/donors?admin_username=&search=` | List/search donors |
+| GET | `/admin/donors/{id}/detail?admin_username=` | Full donor profile |
+| POST | `/admin/change-password/send-otp` | Send password-change OTP |
+| POST | `/admin/change-password/set` | Set new password |
+| GET | `/admin/reports/seva-donations` | Donation report (date range) |
+
+### 📿 Master Data
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/zodiac` | 12 zodiac signs |
+| GET | `/birthstar[?zodiac_id=]` | Birth stars (filter by zodiac) |
+| GET | `/gotra` | All gotras |
+| POST | `/gotra/add` | Add gotra |
+| DELETE | `/gotra/{id}` | Delete gotra |
+| GET | `/relation-types` | Relation type options |
+
+### 🕉️ Hindu Calendar
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/hindu-calendar/purnima-names` | 13 Purnima month names |
+| GET | `/hindu-calendar/amavasya-names` | 13 Amavasya month names |
+| GET | `/hindu-calendar/krishna-paksha-tithis` | 14 Krishna Paksha tithis |
+| GET | `/hindu-calendar/shukla-paksha-tithis` | 14 Shukla Paksha tithis |
+| GET | `/hindu-calendar/convert` | Hindu tithi → English date |
+
+### 📧 OTP
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/email/send-otp` | Send 6-digit OTP via Gmail SMTP |
+| POST | `/email/verify-otp` | Verify email OTP |
+| POST | `/phone/send-otp` | Send SMS OTP via MessageWall |
+| POST | `/phone/verify-otp` | Verify SMS OTP |
+
+### 💬 FAQ
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/faq` | List all FAQs (sorted) |
+| POST | `/faq` | Create FAQ |
+| PUT | `/faq/{id}` | Update FAQ |
+| DELETE | `/faq/{id}` | Delete FAQ |
+| GET | `/faq/categories` | Distinct categories |
+
+---
+
+## 🧾 Receipt Number Format
+
+**Pattern:** `JGN-YYYYMMDD-XXXX`
+
+| Part | Example | Meaning |
+|---|---|---|
+| `JGN` | `JGN` | Jagannath temple prefix |
+| `YYYYMMDD` | `20260501` | Booking date |
+| `XXXX` | `3742` | 4-digit random code |
+
+**Example:** `JGN-20260501-3742`
+
+Uniqueness enforced by MongoDB unique index on `seva_donations.receipt_no`.
+
+---
+
+## 👤 User Roles
+
+| Feature | Admin | Normal User |
+|---|---|---|
+| Login | ✅ | ✅ |
+| Book seva donations | ✅ | ✅ |
+| ⚙️ Admin Panel access | ✅ | ❌ |
+| Add / Edit Sevas | ✅ | ❌ |
+| Add / Delete Gotras | ✅ | ❌ |
+| View full donor details | ✅ | ❌ |
+| Delete donors | ✅ | ❌ |
+| Create / Delete users | ✅ | ❌ |
+
+---
+
+## 🔑 Creating the First Admin Account
+
+1. Start MongoDB and the server:
+   ```bash
+   uvicorn main:app --reload
+   ```
+2. Open **http://localhost:8000**
+3. Click **🔐 Login** in the header
+4. Since no users exist, a **"First-time setup"** section appears automatically
+5. Enter admin mobile number and password → click **Create Admin Account**
+6. This calls `POST /auth/admin-setup` — blocked forever once any user exists
+7. Log in with the same credentials — you'll see a green **ADMIN** badge
+
+---
+
+## 🔍 Useful MongoDB Queries
+
+```js
+// Switch database
+use temple_donation
+
+// List all collections
+show collections
+
+// Count donors
+db.donors.countDocuments()
+
+// Find donor by phone
+db.donors.findOne({ whatsapp_number: "+919876543210" })
+
+// All seva donations for a donor
+db.seva_donations.find({ donor_id: 1 }).pretty()
+
+// Find by receipt number
+db.seva_donations.findOne({ receipt_no: "JGN-20260501-3742" })
+
+// All active sevas
+db.seva.find({ is_active: 1 }).pretty()
+
+// View auto-increment counters
+db.counters.find().pretty()
+
+// All users (hide password hash)
+db.users.find({}, { hashed_password: 0 }).pretty()
+
+// Check indexes on donors collection
+db.donors.getIndexes()
+
+// Search donors by name (case-insensitive)
+db.donors.find({ first_name: { $regex: "ram", $options: "i" } })
+```
+
+---
+
+## 🆚 MySQL → MongoDB Migration Summary
+
+| Aspect | MySQL (old) | MongoDB (new) |
+|---|---|---|
+| Driver | `sqlalchemy` + `pymysql` | `pymongo` |
+| Schema definition | ORM models | Collection constants + `Row` wrapper |
+| ID generation | `AUTO_INCREMENT` | `counters` collection + `get_next_id()` |
+| Read one | `db.query(Model).filter().first()` | `db["col"].find_one({...})` |
+| Read many | `db.query(Model).all()` | `list(db["col"].find({...}))` |
+| Insert | `db.add(obj); db.commit()` | `db["col"].insert_one(doc)` |
+| Update | `obj.field = val; db.commit()` | `db["col"].update_one({}, {"$set":{...}})` |
+| Delete | `db.delete(obj); db.commit()` | `db["col"].delete_one({...})` |
+| Cascade delete | FK `ON DELETE CASCADE` | Explicit delete loops in `main.py` |
+| Unique constraint | `UNIQUE` column | `create_index(..., unique=True)` |
+| Integrity error | `sqlalchemy.exc.IntegrityError` | `pymongo.errors.DuplicateKeyError` |
+| Schema file | `Database.sql` (required) | None — collections auto-created |
+| Seed data | Embedded in `Database.sql` | Run `python seed.py` once |
+| Frontend (`app.js`) | Unchanged | Unchanged |
+| Pydantic schemas | Unchanged | Unchanged |
+
+---
+
+## 🔒 Security Notes
+
+- Never commit `.env` to Git — add it to `.gitignore`
+- All `/admin/*` endpoints require a valid `admin_username` query param
+- Passwords hashed with **bcrypt** via `passlib`
+- OTP state is held in **process memory** — use Redis in production with multiple workers
+- For production: enable HTTPS, add JWT token auth, restrict `allow_origins` in CORS
+- MongoDB should be bound to `127.0.0.1` only — never expose port 27017 publicly
+- Use a named Docker volume (`-v temple_data:/data/db`) so data survives container restarts
+
+---
+
+## 📦 Dependencies
+
+```
+fastapi==0.110.0          Web framework
+uvicorn[standard]==0.29.0 ASGI server
+pymongo==4.7.2            MongoDB driver  ← replaces sqlalchemy + pymysql
+python-dotenv==1.0.1      .env loader
+pydantic[email]==2.6.4    Validation + serialisation
+passlib[bcrypt]==1.7.4    Password hashing
+bcrypt==4.0.1             bcrypt backend
+requests>=2.31.0          HTTP client (SMS / WhatsApp APIs)
+jinja2>=3.1.0             HTML templating
+Pillow>=10.3.0            Image processing (webcam photo)
+ephem>=4.1.5              Hindu calendar → Gregorian conversion
+```
+
+---
+
+## 🐛 Common Issues
+
+| Problem | Solution |
+|---|---|
+| `ServerSelectionTimeoutError` | MongoDB is not running — start it with `net start MongoDB` (Windows) or `sudo systemctl start mongod` (Linux) |
+| `DuplicateKeyError` on startup | `create_indexes()` is idempotent — this is fine; indexes already exist |
+| OTP not received (email) | Check `SMTP_PASSWORD` is a Gmail **App Password**, not your account password |
+| OTP not received (SMS) | Verify `MESSAGEWALL_API_KEY`, `SENDER_ID`, and `TEMPLATE_ID` are correct |
+| `ModuleNotFoundError` | Activate venv first: `venv\Scripts\activate` (Windows) or `source venv/bin/activate` (Linux/Mac) |
+| Port 8000 already in use | Use a different port: `uvicorn main:app --reload --port 8001` |
+| Docker: data lost on restart | Always mount a named volume: `-v temple_data:/data/db` |
+
+---
+
+*Jagannath Temple Donation System — v11.0 MongoDB Edition*

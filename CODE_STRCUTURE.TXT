@@ -1,0 +1,1120 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║       JAGANNATH TEMPLE DONATION SYSTEM — CODE STRUCTURE v11.0               ║
+║       MongoDB Edition  |  FastAPI + PyMongo + Uvicorn                        ║
+║                                                                              ║
+║  This file is a living code-structure document.                              ║
+║  Every section explains WHAT the module does, HOW the MongoDB logic          ║
+║  works, and WHY each pattern was chosen.                                     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+HOW TO RUN
+──────────
+    uvicorn main:app --reload --host 0.0.0.0 --port 8000
+    Open → http://127.0.0.1:8000
+    Docs → http://127.0.0.1:8000/docs
+
+FILE TREE
+─────────
+    project/
+    ├── main.py              ← FastAPI app — all routes (1 000 + lines)
+    ├── database.py          ← MongoClient + get_db() + get_next_id()
+    ├── models.py            ← Row wrapper + collection helpers
+    ├── schemas.py           ← Pydantic request / response models
+    ├── faq_routes.py        ← FAQ CRUD sub-router
+    ├── seed.py              ← Seed master data (zodiac, gotra, tithis …)
+    ├── seed_faq.py          ← Seed FAQ data
+    ├── requirements.txt
+    ├── .env                 ← secrets (never commit to Git)
+    ├── templates/
+    │   └── index.html
+    └── static/
+        ├── app.js
+        └── style.css
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — database.py
+# ══════════════════════════════════════════════════════════════════════════════
+"""
+PURPOSE
+───────
+Central connection layer for MongoDB.  Replaces the old SQLAlchemy engine +
+session factory that was used with MySQL.
+
+KEY OBJECTS EXPORTED
+────────────────────
+    client       — MongoClient singleton
+    db_instance  — the active database object  (MongoClient[DB_NAME])
+    get_db()     — FastAPI Depends generator that yields db_instance
+    get_next_id()— atomic auto-increment helper (replaces MySQL AUTO_INCREMENT)
+    create_indexes() — called once at startup to build all indexes
+"""
+
+# ── actual database.py source ────────────────────────────────────────────────
+
+import os
+from pymongo import MongoClient, ASCENDING
+from dotenv import load_dotenv
+
+load_dotenv()
+
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+DB_NAME   = os.getenv("DB_NAME",   "temple_donation")
+
+client      = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5_000)
+db_instance = client[DB_NAME]
+
+
+# ── AUTO-INCREMENT ────────────────────────────────────────────────────────────
+#
+#   MongoDB uses ObjectId by default.  We want integer IDs (same as MySQL) so
+#   all endpoint logic continues to work without change.
+#
+#   Solution: a "counters" collection where each document tracks the last used
+#   integer ID for one collection:
+#
+#       { _id: "donors", seq: 42 }
+#
+#   find_one_and_update + $inc is atomic — safe under concurrent requests.
+
+def get_next_id(collection_name: str) -> int:
+    """Return the next auto-increment integer ID for *collection_name*."""
+    result = db_instance["counters"].find_one_and_update(
+        {"_id": collection_name},
+        {"$inc": {"seq": 1}},
+        upsert=True,          # create the counter doc if it doesn't exist yet
+        return_document=True, # return the AFTER state (new seq value)
+    )
+    return result["seq"]
+
+# Usage example:
+#   new_id = get_next_id("donors")   # → 1, 2, 3 … (atomically)
+
+
+# ── FASTAPI DEPENDENCY ────────────────────────────────────────────────────────
+
+def get_db():
+    """Yield the MongoDB database.  Used as a FastAPI Depends parameter."""
+    yield db_instance
+
+# Usage in a route:
+#   @app.post("/donors")
+#   def create_donor(data: DonorCreate, db=Depends(get_db)):
+#       db["donors"].insert_one(...)
+
+
+# ── INDEXES ───────────────────────────────────────────────────────────────────
+#
+#   MongoDB does NOT enforce uniqueness or create indexes automatically.
+#   We call create_indexes() once during app startup (@app.on_event("startup")).
+#   This is idempotent — safe to call every time.
+
+def create_indexes():
+    db = db_instance
+
+    # users
+    db["users"].create_index("username",  unique=True)
+    db["users"].create_index("email",     unique=True, sparse=True)
+
+    # user_roles
+    db["user_roles"].create_index("role_name", unique=True)
+
+    # zodiac / birthstar
+    db["zodiac"].create_index("zodiac_order")
+    db["birthstar"].create_index(
+        [("zodiac_id", ASCENDING), ("star_order", ASCENDING)]
+    )
+
+    # gotra
+    db["gotra"].create_index("gotra_name", unique=True)
+
+    # donors  ← most queried collection
+    db["donors"].create_index("whatsapp_number", unique=True)
+    db["donors"].create_index("email",           unique=True)
+    db["donors"].create_index("first_name")
+
+    # seva
+    db["seva"].create_index("seva_name", unique=True)
+
+    # seva_donations
+    db["seva_donations"].create_index("receipt_no", unique=True)
+    db["seva_donations"].create_index("donor_id")
+    db["seva_donations"].create_index("seva_id")
+
+    # seva_persons
+    db["seva_persons"].create_index("seva_donation_id", unique=True)
+
+    # seva_person_relations
+    db["seva_person_relations"].create_index("seva_person_id")
+
+    # Hindu calendar master tables
+    for col in ("purnima_names", "amavasya_names"):
+        db[col].create_index("name",          unique=True)
+        db[col].create_index("display_order")
+
+    for col in ("krishna_paksha_tithis", "shukla_paksha_tithis"):
+        db[col].create_index("tithi_name",   unique=True)
+        db[col].create_index("tithi_number")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — models.py
+# ══════════════════════════════════════════════════════════════════════════════
+"""
+PURPOSE
+───────
+Provides:
+  1. The `Row` class — wraps a MongoDB dict so code can use dot-access
+     (user.id, user.username) instead of dict access (user["_id"]).
+  2. Collection name constants (COL_USERS, COL_DONORS, …).
+  3. Document builder helpers (user_doc, donor_doc, …) that create the
+     correct dict shape before insertion.
+  4. Thin CRUD helpers (find_one, find_all, insert_one, …) that call PyMongo
+     and always return Row objects, keeping main.py clean.
+
+WHY Row?
+────────
+  The old code accessed SQLAlchemy ORM objects with .attribute syntax.
+  Instead of rewriting every attribute access in main.py, Row() wraps any
+  MongoDB dict and provides the same dot-access.  It also maps _id → id
+  automatically.
+"""
+
+# ── Collection name constants ─────────────────────────────────────────────────
+
+COL_USERS                  = "users"
+COL_USER_ROLES             = "user_roles"
+COL_DONORS                 = "donors"
+COL_ZODIAC                 = "zodiac"
+COL_BIRTHSTAR              = "birthstar"
+COL_GOTRA                  = "gotra"
+COL_SEVA                   = "seva"
+COL_SEVA_DONATIONS         = "seva_donations"
+COL_SEVA_PERSONS           = "seva_persons"
+COL_SEVA_PERSON_RELATIONS  = "seva_person_relations"
+COL_PURNIMA_NAMES          = "purnima_names"
+COL_AMAVASYA_NAMES         = "amavasya_names"
+COL_KRISHNA_PAKSHA_TITHIS  = "krishna_paksha_tithis"
+COL_SHUKLA_PAKSHA_TITHIS   = "shukla_paksha_tithis"
+COL_FAQ                    = "faqs"
+
+
+# ── Row class (dot-access wrapper) ────────────────────────────────────────────
+
+class Row:
+    """
+    Wraps a MongoDB document dict to allow attribute-style access.
+
+    Examples
+    --------
+    doc  = db["users"].find_one({"username": "admin"})
+    user = Row(doc)
+
+    user.id          # → doc["_id"]   (maps _id → id automatically)
+    user.username    # → doc["username"]
+    user.is_admin    # → doc["is_admin"]
+    user.missing     # → None  (never raises KeyError)
+    bool(Row(None))  # → False (safe None check)
+    """
+
+    def __init__(self, doc: dict | None):
+        self._doc = doc or {}
+
+    def __bool__(self):
+        return bool(self._doc)
+
+    def __getattr__(self, name: str):
+        # Map .id → ._id so callers don't need to know about MongoDB's _id
+        key = "_id" if name == "id" else name
+        return self._doc.get(key)
+
+    def to_dict(self) -> dict:
+        """Return the raw underlying document."""
+        return self._doc
+
+
+# ── CRUD helper functions ─────────────────────────────────────────────────────
+#
+#   All helpers return Row objects (or lists of Row objects) so main.py code
+#   can use the same .attribute syntax everywhere.
+
+def find_one(db, collection: str, query: dict) -> "Row":
+    """Find a single document; returns Row (falsy if not found)."""
+    return Row(db[collection].find_one(query))
+
+
+def find_all(db, collection: str, query: dict = None,
+             sort: list = None, limit: int = 0) -> list:
+    """Find multiple documents; returns list of Row objects."""
+    cursor = db[collection].find(query or {})
+    if sort:
+        cursor = cursor.sort(sort)
+    if limit:
+        cursor = cursor.limit(limit)
+    return [Row(doc) for doc in cursor]
+
+
+def count_docs(db, collection: str, query: dict = None) -> int:
+    """Count documents matching query."""
+    return db[collection].count_documents(query or {})
+
+
+def insert_one(db, collection: str, doc: dict) -> int:
+    """Insert document; returns the integer _id that was inserted."""
+    db[collection].insert_one(doc)
+    return doc["_id"]
+
+
+def update_one(db, collection: str, query: dict, update: dict) -> int:
+    """Update matching document; returns modified_count (0 or 1)."""
+    result = db[collection].update_one(query, {"$set": update})
+    return result.modified_count
+
+
+def delete_one(db, collection: str, query: dict) -> int:
+    """Delete one document; returns deleted_count."""
+    result = db[collection].delete_one(query)
+    return result.deleted_count
+
+
+def delete_many(db, collection: str, query: dict) -> int:
+    """Delete all matching documents; returns deleted_count."""
+    result = db[collection].delete_many(query)
+    return result.deleted_count
+
+
+# ── Document builder helpers ──────────────────────────────────────────────────
+#
+#   Each function returns the correct dict shape for one collection.
+#   Using builders keeps insert calls consistent and easy to audit.
+
+def user_doc(uid: int, username: str, hashed_password: str,
+             email: str = None, is_admin: int = 0,
+             role_id: int = None) -> dict:
+    return {
+        "_id":             uid,
+        "username":        username,
+        "hashed_password": hashed_password,
+        "email":           email,
+        "is_admin":        is_admin,
+        "role_id":         role_id,
+    }
+
+
+def user_role_doc(rid: int, role_name: str,
+                  description: str = None) -> dict:
+    return {
+        "_id":         rid,
+        "role_name":   role_name,
+        "description": description,
+    }
+
+
+def donor_doc(did: int, **fields) -> dict:
+    """
+    fields may include: first_name, middle_name, last_name, gender,
+    whatsapp_number, email, dob, wedding_date, zodiac_id, birthstar_id,
+    gotra_id, address_line1, address_line2, city, state, pincode,
+    latitude, longitude, profession_type, designation, institution,
+    photo_base64, created_at
+    """
+    return {"_id": did, **fields}
+
+
+def seva_doc(sid: int, seva_name: str, seva_description: str = None,
+             default_amount_one_time: float = 0,
+             default_amount_regular: float = 0,
+             is_active: int = 1) -> dict:
+    return {
+        "_id":                      sid,
+        "seva_name":                seva_name,
+        "seva_description":         seva_description,
+        "default_amount_one_time":  default_amount_one_time,
+        "default_amount_regular":   default_amount_regular,
+        "is_active":                is_active,
+    }
+
+
+def seva_donation_doc(sdid: int, donor_id: int, seva_id: int,
+                      receipt_no: str, seva_type: str,
+                      amount: float, transaction_id: str = None,
+                      booking_date: str = None,
+                      ai_image_base64: str = None,
+                      ai_image_status: str = "pending") -> dict:
+    return {
+        "_id":             sdid,
+        "donor_id":        donor_id,
+        "seva_id":         seva_id,
+        "receipt_no":      receipt_no,
+        "seva_type":       seva_type,
+        "amount":          amount,
+        "transaction_id":  transaction_id,
+        "booking_date":    booking_date,
+        "ai_image_base64": ai_image_base64,
+        "ai_image_status": ai_image_status,
+    }
+
+
+def seva_person_doc(spid: int, seva_donation_id: int, **fields) -> dict:
+    """
+    fields: first_name, middle_name, last_name, gotra_id, birthstar_id,
+            zodiac_id, seva_date_english, seva_date_type,
+            purnima_name_id, amavasya_name_id,
+            krishna_paksha_tithi_id, shukla_paksha_tithi_id,
+            hindu_year, hindu_month_number
+    """
+    return {"_id": spid, "seva_donation_id": seva_donation_id, **fields}
+
+
+def seva_person_relation_doc(rid: int, seva_person_id: int,
+                              relation_type: str,
+                              first_name: str, middle_name: str = None,
+                              last_name: str = None, gotra_id: int = None,
+                              birthstar_id: int = None,
+                              zodiac_id: int = None) -> dict:
+    return {
+        "_id":             rid,
+        "seva_person_id":  seva_person_id,
+        "relation_type":   relation_type,
+        "first_name":      first_name,
+        "middle_name":     middle_name,
+        "last_name":       last_name,
+        "gotra_id":        gotra_id,
+        "birthstar_id":    birthstar_id,
+        "zodiac_id":       zodiac_id,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — schemas.py  (Pydantic models — UNCHANGED from MySQL version)
+# ══════════════════════════════════════════════════════════════════════════════
+"""
+PURPOSE
+───────
+Pydantic v2 models used for:
+  • Request body validation (FastAPI reads JSON → validates → passes to route)
+  • Response serialisation
+
+UNCHANGED FROM MySQL VERSION
+────────────────────────────
+  schemas.py has zero dependency on the database layer.  Every model here is
+  pure Python / Pydantic.  None of it needed to change when migrating to MongoDB.
+
+KEY SCHEMAS
+───────────
+    AdminSetupSchema      — first-time admin creation
+    UserSignupSchema      — normal user registration
+    AdminLoginSchema      — login (username + password)
+    DonorCreate           — new donor form (Step 2)
+    DonorUpdate           — update donor details
+    SevaCreate            — admin adds a new seva
+    SevaDonationCreate    — full booking submission (Step 3)
+    SevaPersonCreate      — seva person + relations (Step 4)
+    FaqCreate / FaqUpdate — FAQ management
+"""
+
+# Example schema definitions (representative subset):
+
+from pydantic import BaseModel, EmailStr, field_validator
+from typing import Optional, List
+import re
+
+
+class AdminSetupSchema(BaseModel):
+    username: str
+    password: str
+    phone:    str  # verified via OTP before this call
+
+    @field_validator("password")
+    @classmethod
+    def strong_password(cls, v):
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        return v
+
+
+class AdminLoginSchema(BaseModel):
+    username: str
+    password: str
+
+
+class UserSignupSchema(BaseModel):
+    username: str
+    password: str
+    email:    Optional[EmailStr] = None
+
+
+class DonorCreate(BaseModel):
+    first_name:       str
+    middle_name:      Optional[str] = None
+    last_name:        Optional[str] = None
+    gender:           str                       # M / F / O
+    whatsapp_number:  str
+    email:            Optional[EmailStr] = None
+    dob:              Optional[str] = None      # YYYY-MM-DD
+    wedding_date:     Optional[str] = None
+    zodiac_id:        Optional[int] = None
+    birthstar_id:     Optional[int] = None
+    gotra_id:         Optional[int] = None
+    address_line1:    Optional[str] = None
+    address_line2:    Optional[str] = None
+    city:             Optional[str] = None
+    state:            Optional[str] = None
+    pincode:          Optional[str] = None
+    latitude:         Optional[float] = None
+    longitude:        Optional[float] = None
+    profession_type:  Optional[str] = None      # work / student / other
+    designation:      Optional[str] = None
+    institution:      Optional[str] = None
+    photo_base64:     Optional[str] = None
+
+
+class SevaCreate(BaseModel):
+    seva_name:               str
+    seva_description:        Optional[str] = None
+    default_amount_one_time: float = 0.0
+    default_amount_regular:  float = 0.0
+    is_active:               bool = True
+
+
+class SevaDonationCreate(BaseModel):
+    donor_id:       int
+    seva_id:        int
+    seva_type:      str          # "One Time" | "Regular"
+    amount:         float
+    transaction_id: Optional[str] = None
+    booking_date:   Optional[str] = None
+
+
+class SevaPersonCreate(BaseModel):
+    seva_donation_id:        int
+    first_name:              str
+    middle_name:             Optional[str] = None
+    last_name:               Optional[str] = None
+    gotra_id:                Optional[int] = None
+    birthstar_id:            Optional[int] = None
+    zodiac_id:               Optional[int] = None
+    # English date OR Hindu calendar fields (one or the other)
+    seva_date_english:       Optional[str] = None
+    seva_date_type:          Optional[str] = None   # "purnima"|"amavasya"|"krishna"|"shukla"
+    purnima_name_id:         Optional[int] = None
+    amavasya_name_id:        Optional[int] = None
+    krishna_paksha_tithi_id: Optional[int] = None
+    shukla_paksha_tithi_id:  Optional[int] = None
+    hindu_year:              Optional[int] = None
+    hindu_month_number:      Optional[int] = None
+    relations:               List[dict] = []
+
+
+class FaqCreate(BaseModel):
+    question: str
+    answer:   str
+    category: Optional[str] = None
+    order:    int = 0
+
+
+class FaqUpdate(BaseModel):
+    question: Optional[str] = None
+    answer:   Optional[str] = None
+    category: Optional[str] = None
+    order:    Optional[int] = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — main.py  (FastAPI Application)
+# ══════════════════════════════════════════════════════════════════════════════
+"""
+PURPOSE
+───────
+The application entry point.  Registers all HTTP routes, handles startup
+hooks, and contains all business logic for the donation system.
+
+SIZE
+────
+  ~1 000 lines.  One file intentionally — the project is a focused domain
+  application and splitting into many files would add indirection without benefit.
+
+STARTUP HOOK
+────────────
+  @app.on_event("startup") calls:
+      create_indexes()    — ensures all MongoDB indexes exist
+      _init_user_roles()  — seeds default role labels if missing
+
+STATIC FILES & TEMPLATES
+─────────────────────────
+  app.mount("/static", StaticFiles(directory="static"), name="static")
+  templates = Jinja2Templates(directory="templates")
+
+  @app.get("/")
+  def index(request: Request):
+      return templates.TemplateResponse("index.html", {"request": request})
+
+CORS
+────
+  Allows all origins (*) — suitable for development.
+  Restrict to your domain in production.
+"""
+
+# ── Route groups and their MongoDB patterns ───────────────────────────────────
+
+# ─────────────────────────────────
+# GROUP A: Auth & User Management
+# ─────────────────────────────────
+"""
+POST /auth/admin-setup
+    1. Verify OTP was confirmed (in-memory flag)
+    2. Check db["users"].count_documents({}) == 0  → first-time only
+    3. Hash password with passlib CryptContext (bcrypt)
+    4. new_id = get_next_id("users")
+    5. db["users"].insert_one(user_doc(new_id, ...))
+
+POST /auth/login
+    1. user = db["users"].find_one({"username": body.username})
+    2. pwd_context.verify(body.password, user["hashed_password"])
+    3. Return {id, username, is_admin, role_id}
+
+POST /auth/forgot-password/set-password
+    1. Verify OTP was confirmed
+    2. new_hash = pwd_context.hash(new_password)
+    3. db["users"].update_one({"username": username}, {"$set": {"hashed_password": new_hash}})
+"""
+
+# ─────────────────────────────────
+# GROUP B: Donor Management
+# ─────────────────────────────────
+"""
+GET /check-phone?whatsapp_number=+91...
+    donor_doc = db["donors"].find_one({"whatsapp_number": phone})
+    if donor_doc: return Row(donor_doc).to_dict()
+    else:         raise HTTPException(404)
+
+POST /donors
+    1. Validate no duplicate phone / email:
+           db["donors"].find_one({"whatsapp_number": data.whatsapp_number})
+    2. new_id = get_next_id("donors")
+    3. doc = donor_doc(new_id, **data.model_dump())
+    4. try:
+           db["donors"].insert_one(doc)
+       except DuplicateKeyError:
+           raise HTTPException(400, "Phone/email already exists")
+
+PUT /donors/{id}
+    db["donors"].update_one({"_id": id}, {"$set": changed_fields})
+
+DELETE /donors/{id}  ← cascade delete (explicit, no FK constraints in MongoDB)
+    # 1. find all seva_donations for this donor
+    donations = list(db["seva_donations"].find({"donor_id": id}))
+    donation_ids = [d["_id"] for d in donations]
+
+    # 2. find all seva_persons for those donations
+    persons = list(db["seva_persons"].find(
+        {"seva_donation_id": {"$in": donation_ids}}
+    ))
+    person_ids = [p["_id"] for p in persons]
+
+    # 3. delete relations → persons → donations → donor
+    db["seva_person_relations"].delete_many(
+        {"seva_person_id": {"$in": person_ids}}
+    )
+    db["seva_persons"].delete_many(
+        {"seva_donation_id": {"$in": donation_ids}}
+    )
+    db["seva_donations"].delete_many({"donor_id": id})
+    db["donors"].delete_one({"_id": id})
+"""
+
+# ─────────────────────────────────
+# GROUP C: Seva & Donations
+# ─────────────────────────────────
+"""
+POST /seva-donations
+    1. Generate receipt number:
+           import random, datetime
+           receipt_no = f"JGN-{datetime.date.today():%Y%m%d}-{random.randint(1000,9999)}"
+
+    2. Persist donation:
+           sd_id = get_next_id("seva_donations")
+           db["seva_donations"].insert_one(seva_donation_doc(sd_id, ...))
+
+    3. Persist seva_person (one per booking):
+           sp_id = get_next_id("seva_persons")
+           db["seva_persons"].insert_one(seva_person_doc(sp_id, sd_id, ...))
+
+    4. Persist relations (zero or more):
+           for rel in data.relations:
+               r_id = get_next_id("seva_person_relations")
+               db["seva_person_relations"].insert_one(seva_person_relation_doc(r_id, sp_id, ...))
+
+    5. Return {receipt_no, seva_donation_id}
+
+GET /receipt/{receipt_no}  ← Step 5 receipt page
+    sd  = db["seva_donations"].find_one({"receipt_no": receipt_no})
+    d   = db["donors"].find_one({"_id": sd["donor_id"]})
+    s   = db["seva"].find_one({"_id": sd["seva_id"]})
+    sp  = db["seva_persons"].find_one({"seva_donation_id": sd["_id"]})
+    rel = list(db["seva_person_relations"].find({"seva_person_id": sp["_id"]}))
+    # … assemble and return receipt dict
+"""
+
+# ─────────────────────────────────
+# GROUP D: OTP Flows (in-memory)
+# ─────────────────────────────────
+"""
+OTP state is stored as a Python dict in the process — suitable for single-worker
+development.  For production with multiple workers, use Redis.
+
+    _email_otp_store: dict[str, dict] = {}
+    # { email: { otp: "123456", expires: timestamp, verified: bool } }
+
+    _phone_otp_store: dict[str, dict] = {}
+    # { phone: { otp: "123456", expires: timestamp, verified: bool } }
+
+POST /email/send-otp
+    otp = str(random.randint(100000, 999999))
+    _email_otp_store[email] = {
+        "otp": otp, "expires": time.time() + 300, "verified": False
+    }
+    # Send via SMTP (smtplib)
+
+POST /email/verify-otp
+    entry = _email_otp_store.get(email)
+    if not entry or entry["otp"] != otp or time.time() > entry["expires"]:
+        raise HTTPException(400, "Invalid or expired OTP")
+    entry["verified"] = True
+
+POST /phone/send-otp
+    # Send via MessageWall HTTP API:
+    requests.get(MESSAGEWALL_API_URL, params={
+        "apikey": API_KEY,
+        "senderid": SENDER_ID,
+        "number": phone,
+        "message": f"Your OTP is {otp}",
+        "templateid": TEMPLATE_ID,
+        "route": ROUTE,
+    })
+"""
+
+# ─────────────────────────────────
+# GROUP E: Hindu Calendar
+# ─────────────────────────────────
+"""
+GET /hindu-calendar/convert
+    Uses the `ephem` library to convert a Hindu tithi (paksha + tithi number
+    + month + year) to a Gregorian calendar date.
+
+    Algorithm (simplified):
+        1. Determine approximate new-moon date for the Hindu month
+        2. Add the tithi offset days (each tithi ≈ 0.9 solar days)
+        3. Return the resulting Gregorian date
+
+GET /hindu-calendar/purnima-names  etc.
+    Simple lookups:
+        docs = list(db["purnima_names"].find({}).sort("display_order", 1))
+        return [Row(d).to_dict() for d in docs]
+"""
+
+# ─────────────────────────────────
+# GROUP F: AI Blessing Card
+# ─────────────────────────────────
+"""
+POST /seva-donations/{id}/generate-seva-image
+    Builds a prompt from donor name + seva name + seva date:
+        prompt = f"Sacred Hindu temple artwork for {seva_name} performed by {donor_name} …"
+
+    Calls Pollinations.ai image API (free, no API key needed):
+        url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}"
+
+    Stores base64-encoded image in MongoDB:
+        db["seva_donations"].update_one(
+            {"_id": donation_id},
+            {"$set": {"ai_image_base64": b64_string, "ai_image_status": "done"}}
+        )
+
+GET /seva-donations/{id}/seva-image-status
+    Returns {"status": "pending"|"done"|"failed"}
+
+GET /seva-donations/{id}/seva-image
+    Returns {"image": "<base64 string>"}
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — faq_routes.py
+# ══════════════════════════════════════════════════════════════════════════════
+"""
+PURPOSE
+───────
+An APIRouter sub-module mounted at /faq in main.py:
+    app.include_router(faq_router)
+
+ROUTES
+──────
+    GET    /faq                → list all FAQs (sorted by order, then _id)
+    POST   /faq                → admin creates FAQ
+    PUT    /faq/{id}           → admin updates FAQ
+    DELETE /faq/{id}           → admin deletes FAQ
+    GET    /faq/categories     → list distinct categories
+
+MONGODB PATTERNS
+────────────────
+    # list (sorted)
+    docs = list(db["faqs"].find({}).sort([("order", 1), ("_id", 1)]))
+
+    # create
+    faq_id = get_next_id("faqs")
+    db["faqs"].insert_one({
+        "_id": faq_id,
+        "question": data.question,
+        "answer":   data.answer,
+        "category": data.category,
+        "order":    data.order,
+    })
+
+    # update
+    db["faqs"].update_one({"_id": id}, {"$set": changed})
+
+    # delete
+    db["faqs"].delete_one({"_id": id})
+
+    # distinct categories
+    categories = db["faqs"].distinct("category")
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — seed.py  &  seed_faq.py
+# ══════════════════════════════════════════════════════════════════════════════
+"""
+PURPOSE
+───────
+One-time data seeding scripts.  Run once after the MongoDB database is empty:
+
+    python seed.py
+    python seed_faq.py
+
+WHAT seed.py SEEDS
+──────────────────
+  Collection            Count    Content
+  ─────────────────     ─────    ──────────────────────────────────────────────
+  zodiac                12       Mesha … Meena (with zodiac_order 1–12)
+  birthstar             27       All 27 Nakshatras linked to zodiac_id
+  gotra                 10       Kashyapa, Bharadwaja, Vasishtha … Sandilya
+  purnima_names         13       Chaitra Purnima … Phalguna Purnima
+  amavasya_names        13       Chaitra Amavasya … Phalguna Amavasya
+  krishna_paksha_tithis 14       Pratipada … Chaturdashi (waning moon)
+  shukla_paksha_tithis  14       Pratipada … Chaturdashi (waxing moon)
+  counters               7       Initialises seq for each seeded collection
+
+IDEMPOTENT PATTERN
+──────────────────
+  for item in SEED_DATA:
+      if not db["zodiac"].find_one({"_id": item["_id"]}):
+          db["zodiac"].insert_one(item)
+  # Also upserts the counter:
+  db["counters"].update_one(
+      {"_id": "zodiac"},
+      {"$setOnInsert": {"seq": 12}},
+      upsert=True
+  )
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — MongoDB QUERY PATTERNS  (cheat sheet)
+# ══════════════════════════════════════════════════════════════════════════════
+"""
+MySQL (old)                             MongoDB (new)
+──────────────────────────────────────  ────────────────────────────────────────
+db.query(User).filter_by(id=1).first()  db["users"].find_one({"_id": 1})
+db.query(User).filter(                  db["users"].find_one({
+    User.username=="admin").first()          "username": "admin"})
+
+db.query(User).all()                    list(db["users"].find({}))
+
+db.query(Donor).filter(                 list(db["donors"].find(
+    Donor.first_name.like("%ram%")           {"first_name": {"$regex": "ram",
+).all()                                      "$options": "i"}}))
+
+db.query(Donor).count()                 db["donors"].count_documents({})
+
+db.add(new_user); db.commit()           db["users"].insert_one(user_doc(…))
+
+user.email = new_email; db.commit()     db["users"].update_one(
+                                            {"_id": uid},
+                                            {"$set": {"email": new_email}})
+
+db.delete(user); db.commit()            db["users"].delete_one({"_id": uid})
+
+session.query(X).                       db["x"].find(
+    order_by(X.name.asc()).limit(10)        {}).sort("name", 1).limit(10)
+
+session.query(X).                       db["x"].find(
+    filter(X.y_id == yid).all()             {"y_id": yid})
+
+# IN clause
+session.query(X).filter(               db["x"].find(
+    X.id.in_([1,2,3])).all()               {"_id": {"$in": [1, 2, 3]}})
+
+# JOIN (simulated)                      # No joins in MongoDB.
+# SELECT d.*, s.seva_name               # Two separate lookups:
+# FROM seva_donations d                 sd = db["seva_donations"].find_one(…)
+# JOIN seva s ON s.id = d.seva_id       s  = db["seva"].find_one({"_id": sd["seva_id"]})
+
+IntegrityError (duplicate)              DuplicateKeyError  (pymongo.errors)
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 8 — ENVIRONMENT VARIABLES  (.env reference)
+# ══════════════════════════════════════════════════════════════════════════════
+"""
+Variable                    Required   Default                   Description
+──────────────────────────  ────────   ────────────────────────  ──────────────
+MONGO_URI                   ✅         mongodb://localhost:27017  PyMongo DSN
+DB_NAME                     ✅         temple_donation           Database name
+SMTP_HOST                   ✅         smtp.gmail.com            Email server
+SMTP_PORT                   ✅         587                       STARTTLS port
+SMTP_USER                   ✅         —                         Gmail address
+SMTP_PASSWORD               ✅         —                         App password
+SMTP_FROM                   ✅         —                         From address
+MESSAGEWALL_API_KEY         ✅         —                         SMS API key
+MESSAGEWALL_SENDER_ID       ✅         —                         DLT Sender ID
+MESSAGEWALL_TEMPLATE_ID     ✅         —                         OTP template
+MESSAGEWALL_ROUTE           ✅         2                         Route number
+MESSAGEWALL_API_URL         ✅         http://text.messagewall…  Endpoint
+MESSAGEWALL_SETUP_TEMPLATE_ID ⚠️       —                         Admin setup OTP template
+WA_API_KEY                  ⚠️         —                         WhatsApp API key
+WA_PHONE_NUMBER_ID          ⚠️         —                         WA phone number ID
+WA_TEMPLATE_NAME            ⚠️         —                         WA template name
+WA_API_BASE                 ⚠️         https://partnersv1…      WhatsApp API base URL
+
+Legend:  ✅ required for core functions   ⚠️ required for that feature only
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 9 — DOCKER DEPLOYMENT
+# ══════════════════════════════════════════════════════════════════════════════
+"""
+Single-container deployment using Supervisor (MongoDB + FastAPI in one image):
+
+    # Build
+    docker build -t temple-donation .
+
+    # Run (first time — creates named volume for data)
+    docker run -d \
+        -p 8000:8000 \
+        -v temple_data:/data/db \
+        -e DB_NAME=temple_donation \
+        -e SMTP_USER=you@gmail.com \
+        -e SMTP_PASSWORD=apppassword \
+        --name temple-app \
+        temple-donation
+
+    # Seed data (first time only)
+    docker exec -it temple-app python seed.py
+    docker exec -it temple-app python seed_faq.py
+
+    # Live logs
+    docker logs -f temple-app
+
+    # Open shell
+    docker exec -it temple-app bash
+
+    # MongoDB shell inside container
+    docker exec -it temple-app mongosh
+
+    # Stop / restart
+    docker stop temple-app
+    docker start temple-app
+
+    # Remove container but keep data volume
+    docker rm temple-app
+    # Volume temple_data persists — re-attach with -v temple_data:/data/db
+
+Dockerfile summary:
+    Base image  : python:3.12-slim
+    Adds         : MongoDB 7 (official APT repo) + supervisor
+    Process mgr  : supervisord — starts MongoDB first (priority 10),
+                   FastAPI second (priority 20, waits 10s for Mongo ready)
+    Exposed port : 8000
+    Data volume  : /data/db  ← must be mounted as a named volume in production
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 10 — DATA FLOW DIAGRAM
+# ══════════════════════════════════════════════════════════════════════════════
+"""
+Step 1  WhatsApp number entered
+        │
+        ├─► GET /check-phone?whatsapp_number=+91XXXXXXXXXX
+        │       MongoDB: db["donors"].find_one({"whatsapp_number": phone})
+        │       EXISTS  → pre-fill form with donor data → skip OTP
+        │       MISSING → POST /phone/send-otp → verify → empty form
+        ▼
+Step 2  Donor details submitted
+        │
+        ├─► POST /donors   (new donor)
+        │   OR PUT /donors/{id}  (existing donor update)
+        │       MongoDB: insert_one / update_one in "donors" collection
+        ▼
+Step 3  Seva selection & payment details
+        │
+        ├─► GET /admin/sevas  → list active sevas from "seva" collection
+        ├─► POST /seva-donations
+        │       MongoDB:
+        │         receipt_no = f"JGN-{today:%Y%m%d}-{rand:04d}"
+        │         sd_id = get_next_id("seva_donations")
+        │         db["seva_donations"].insert_one(seva_donation_doc(…))
+        ▼
+Step 4  Seva person + family members
+        │
+        ├─► POST /seva-persons  (or included in /seva-donations body)
+        │       MongoDB:
+        │         sp_id = get_next_id("seva_persons")
+        │         db["seva_persons"].insert_one(seva_person_doc(…))
+        │         for each relation:
+        │           r_id = get_next_id("seva_person_relations")
+        │           db["seva_person_relations"].insert_one(…)
+        ▼
+Step 5  Receipt & confirmation
+        │
+        ├─► GET /receipt/{receipt_no}
+        │       MongoDB: join 5 collections manually (find_one × 5)
+        ├─► POST /seva-donations/{id}/send-confirmation  → SMTP email
+        ├─► POST /seva-donations/{id}/send-whatsapp      → co3.live API
+        └─► POST /seva-donations/{id}/generate-seva-image
+                → Pollinations.ai → base64 → update_one "ai_image_base64"
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 11 — COLLECTION SCHEMA REFERENCE
+# ══════════════════════════════════════════════════════════════════════════════
+"""
+counters
+    _id:  str   (collection name, e.g. "donors")
+    seq:  int   (current max ID)
+
+users
+    _id:             int   (auto-increment)
+    username:        str   UNIQUE
+    hashed_password: str
+    email:           str?  UNIQUE sparse
+    is_admin:        int   (0 | 1)
+    role_id:         int?
+
+user_roles
+    _id:         int
+    role_name:   str   UNIQUE
+    description: str?
+
+zodiac
+    _id:          int
+    zodiac_name:  str
+    zodiac_order: int
+
+birthstar
+    _id:          int
+    star_name:    str
+    zodiac_id:    int   (ref → zodiac._id)
+    star_order:   int
+
+gotra
+    _id:        int
+    gotra_name: str   UNIQUE
+
+donors
+    _id:              int
+    first_name:       str
+    middle_name:      str?
+    last_name:        str?
+    gender:           str   (M | F | O)
+    whatsapp_number:  str   UNIQUE
+    email:            str?  UNIQUE
+    dob:              str?  (YYYY-MM-DD)
+    wedding_date:     str?
+    zodiac_id:        int?
+    birthstar_id:     int?
+    gotra_id:         int?
+    address_line1:    str?
+    address_line2:    str?
+    city:             str?
+    state:            str?
+    pincode:          str?
+    latitude:         float?
+    longitude:        float?
+    profession_type:  str?  (work | student | other)
+    designation:      str?
+    institution:      str?
+    photo_base64:     str?
+    created_at:       str
+
+seva
+    _id:                     int
+    seva_name:               str   UNIQUE
+    seva_description:        str?
+    default_amount_one_time: float
+    default_amount_regular:  float
+    is_active:               int   (0 | 1)
+
+seva_donations
+    _id:             int
+    donor_id:        int   (ref → donors._id)
+    seva_id:         int   (ref → seva._id)
+    receipt_no:      str   UNIQUE  e.g. "JGN-20260501-3742"
+    seva_type:       str   ("One Time" | "Regular")
+    amount:          float
+    transaction_id:  str?
+    booking_date:    str
+    ai_image_base64: str?
+    ai_image_status: str   ("pending" | "done" | "failed")
+
+seva_persons
+    _id:                     int
+    seva_donation_id:        int   UNIQUE (ref → seva_donations._id)
+    first_name:              str
+    middle_name:             str?
+    last_name:               str?
+    gotra_id:                int?
+    birthstar_id:            int?
+    zodiac_id:               int?
+    seva_date_english:       str?  (YYYY-MM-DD)
+    seva_date_type:          str?  (purnima | amavasya | krishna | shukla)
+    purnima_name_id:         int?
+    amavasya_name_id:        int?
+    krishna_paksha_tithi_id: int?
+    shukla_paksha_tithi_id:  int?
+    hindu_year:              int?
+    hindu_month_number:      int?
+
+seva_person_relations
+    _id:            int
+    seva_person_id: int   (ref → seva_persons._id)
+    relation_type:  str   (wife | husband | son | daughter | father | mother | other)
+    first_name:     str
+    middle_name:    str?
+    last_name:      str?
+    gotra_id:       int?
+    birthstar_id:   int?
+    zodiac_id:      int?
+
+purnima_names / amavasya_names
+    _id:           int
+    name:          str   UNIQUE
+    display_order: int
+
+krishna_paksha_tithis / shukla_paksha_tithis
+    _id:          int
+    tithi_name:   str   UNIQUE
+    tithi_number: int
+
+faqs
+    _id:      int
+    question: str
+    answer:   str
+    category: str?
+    order:    int
+"""
